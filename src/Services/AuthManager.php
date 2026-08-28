@@ -2,28 +2,33 @@
 
 namespace Tihloh\Prefab\Auth\Services;
 
+use PDO;
 use RuntimeException;
+use Tihloh\Prefab\DatabaseInterface;
 use Tihloh\Prefab\PrefabConfig;
 use Tihloh\Prefab\PrefabRuntime;
 use Tihloh\Prefab\Auth\Adapters\PrefabUsersAuthProvider;
+use Tihloh\Prefab\Auth\Contracts\AuthCredentialStoreInterface;
 use Tihloh\Prefab\Auth\Contracts\AuthSessionStoreInterface;
 use Tihloh\Prefab\Auth\Contracts\AuthUserProviderInterface;
 use Tihloh\Prefab\Auth\Contracts\AuthenticatableUserInterface;
+use Tihloh\Prefab\Auth\Credentials\PdoCredentialStore;
 use Tihloh\Prefab\Auth\DTOs\AuthResult;
 use Tihloh\Prefab\Auth\Session\NativeSessionStore;
 
 /**
  * Standalone authentication service with optional Prefab auto-integration.
  *
- * Auth can use an explicit provider/session, PrefabConfig values, or a compatible
- * `user_provider` capability. When Prefab Users provides the discovered user
- * provider, Auth wraps the Users module with PrefabUsersAuthProvider so existing
- * Auth behavior remains unchanged.
+ * Identity belongs to the host project/user provider. Password credentials may
+ * live in Auth-owned storage, so the project's users table does not need a
+ * password column. Legacy providers that expose authPasswordHash() remain
+ * supported as a fallback.
  */
 final class AuthManager
 {
     private ?AuthUserProviderInterface $users = null;
     private ?AuthSessionStoreInterface $session = null;
+    private ?AuthCredentialStoreInterface $credentials = null;
     private array $config = [];
     private ?object $context = null;
     private ?object $events = null;
@@ -58,7 +63,7 @@ final class AuthManager
         PrefabRuntime::register('auth', $this);
     }
 
-    /** Resolve missing session/provider/logger references during startup. */
+    /** Resolve missing session/provider/credential/logger references. */
     public function prefabConfigure(): void
     {
         if (!$this->session) {
@@ -131,6 +136,58 @@ final class AuthManager
             }
         }
 
+        if (!$this->credentials) {
+            $configured = PrefabConfig::resolve(
+                'auth',
+                'credential_store',
+                $this->config,
+            );
+
+            if ($configured['value'] instanceof AuthCredentialStoreInterface) {
+                $this->credentials = $configured['value'];
+                PrefabRuntime::recordResolution(
+                    'auth',
+                    'credential_store',
+                    $configured['source'],
+                    ['provider' => $this->credentials::class],
+                );
+            } else {
+                $database = $this->credentialDatabase();
+
+                if ($database) {
+                    $table = PrefabConfig::resolve(
+                        'auth',
+                        'credentials_table',
+                        $this->config,
+                        'prefab_auth_credentials',
+                    );
+
+                    $this->credentials = new PdoCredentialStore(
+                        $database,
+                        (string) $table['value'],
+                    );
+
+                    PrefabRuntime::recordResolution(
+                        'auth',
+                        'credential_store',
+                        'database-store',
+                        [
+                            'provider' => PdoCredentialStore::class,
+                            'table' => (string) $table['value'],
+                        ],
+                    );
+                }
+            }
+        }
+
+        if ($this->credentials) {
+            PrefabRuntime::provide(
+                'auth_credentials',
+                $this->credentials,
+                'prefab-auth',
+            );
+        }
+
         if (!$this->autoLogger) {
             $logger = PrefabRuntime::resolveEntry('logger');
 
@@ -145,11 +202,9 @@ final class AuthManager
             }
         }
 
-        /* Auth publishes the current-actor capability for Logs/Users/etc. */
         PrefabRuntime::provide('actor_provider', $this, 'prefab-auth');
     }
 
-    /** Explain how this module resolved its integrations. */
     public function explain(): array
     {
         return PrefabRuntime::explain('auth');
@@ -165,6 +220,52 @@ final class AuthManager
     {
         $this->events = $events;
         return $this;
+    }
+
+    public function setPassword(int|string $userId, string $password): void
+    {
+        if ($password === '') {
+            throw new RuntimeException('Password cannot be empty.');
+        }
+
+        if (!$this->provider()->findById($userId)) {
+            throw new RuntimeException('Cannot set a password for an unknown user.');
+        }
+
+        $this->credentialStore()->setPasswordHash(
+            $userId,
+            password_hash($password, PASSWORD_DEFAULT),
+        );
+    }
+
+    public function hasPassword(int|string $userId): bool
+    {
+        return $this->passwordHashForId($userId) !== null;
+    }
+
+    public function verifyPassword(int|string $userId, string $password): bool
+    {
+        $hash = $this->passwordHashForId($userId);
+
+        return $hash !== null && password_verify($password, $hash);
+    }
+
+    public function changePassword(
+        int|string $userId,
+        string $currentPassword,
+        string $newPassword,
+    ): bool {
+        if (!$this->verifyPassword($userId, $currentPassword)) {
+            return false;
+        }
+
+        $this->setPassword($userId, $newPassword);
+        return true;
+    }
+
+    public function removePassword(int|string $userId): void
+    {
+        $this->credentialStore()->remove($userId);
     }
 
     public function attempt(
@@ -188,7 +289,7 @@ final class AuthManager
             );
         }
 
-        $hash = $user->authPasswordHash();
+        $hash = $this->passwordHashFor($user);
 
         if (!$hash || !password_verify($password, $hash)) {
             return $this->result(
@@ -254,12 +355,13 @@ final class AuthManager
     private function provider(): AuthUserProviderInterface
     {
         if (!$this->users) {
-            throw new RuntimeException(
-                'Prefab Auth needs an auth provider or compatible user_provider capability.',
-            );
+            $this->prefabConfigure();
         }
 
-        return $this->users;
+        return $this->users
+            ?? throw new RuntimeException(
+                'Prefab Auth needs an auth provider or compatible user_provider capability.',
+            );
     }
 
     private function session(): AuthSessionStoreInterface
@@ -270,6 +372,62 @@ final class AuthManager
 
         return $this->session
             ?? throw new RuntimeException('Prefab Auth session is unavailable.');
+    }
+
+    private function credentialStore(): AuthCredentialStoreInterface
+    {
+        if (!$this->credentials) {
+            $this->prefabConfigure();
+        }
+
+        return $this->credentials
+            ?? throw new RuntimeException(
+                'Prefab Auth needs a credential store or database to manage passwords.',
+            );
+    }
+
+    private function passwordHashFor(AuthenticatableUserInterface $user): ?string
+    {
+        if (!$this->credentials) {
+            $this->prefabConfigure();
+        }
+
+        $stored = $this->credentials?->passwordHash($user->authId());
+
+        return $stored ?: $user->authPasswordHash();
+    }
+
+    private function passwordHashForId(int|string $userId): ?string
+    {
+        $user = $this->provider()->findById($userId);
+
+        return $user ? $this->passwordHashFor($user) : null;
+    }
+
+    private function credentialDatabase(): DatabaseInterface|PDO|null
+    {
+        $direct = $this->config['database'] ?? null;
+        if ($direct instanceof DatabaseInterface || $direct instanceof PDO) {
+            return $direct;
+        }
+
+        $module = PrefabConfig::moduleOnly('auth');
+        $moduleDatabase = $module['database'] ?? null;
+        if ($moduleDatabase instanceof DatabaseInterface || $moduleDatabase instanceof PDO) {
+            return $moduleDatabase;
+        }
+
+        $common = PrefabConfig::get('database');
+        if ($common instanceof DatabaseInterface || $common instanceof PDO) {
+            return $common;
+        }
+
+        $entry = PrefabRuntime::resolveEntry('database');
+        $value = $entry['value'] ?? null;
+
+        return $value instanceof DatabaseInterface || $value instanceof PDO
+            ? $value
+            : null;
     }
 
     private function result(
