@@ -12,14 +12,27 @@ final class PrefabUsersAuthProvider implements AuthUserProviderInterface
     public function findByIdentifier(string $identifier): ?AuthenticatableUserInterface
     {
         if (!method_exists($this->users, 'findByEmail')) return null;
-        $user = $this->users->findByEmail($identifier);
-        return $user instanceof AuthenticatableUserInterface ? $user : null;
+
+        return $this->adapt($this->users->findByEmail($identifier));
     }
 
     public function findById(int|string $id): ?AuthenticatableUserInterface
     {
         if (!method_exists($this->users, 'find')) return null;
-        $user = $this->users->find($id);
-        return $user instanceof AuthenticatableUserInterface ? $user : null;
+
+        return $this->adapt($this->users->find($id));
+    }
+
+    private function adapt(mixed $user): ?AuthenticatableUserInterface
+    {
+        if ($user instanceof AuthenticatableUserInterface) {
+            return $user;
+        }
+
+        if (!is_object($user) || !isset($user->id)) {
+            return null;
+        }
+
+        return new PrefabUserAuthIdentity($user);
     }
 }
