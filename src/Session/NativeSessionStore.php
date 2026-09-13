@@ -10,6 +10,7 @@ final class NativeSessionStore implements AuthSessionStoreInterface
     private string $startedKey;
     private string $activityKey;
     private ?string $expirationReason = null;
+    private int|string|null $expiredUserId = null;
 
     public function __construct(
         private string $key = 'auth:user_id',
@@ -37,6 +38,7 @@ final class NativeSessionStore implements AuthSessionStoreInterface
         $_SESSION[$this->startedKey] = $now;
         $_SESSION[$this->activityKey] = $now;
         $this->expirationReason = null;
+        $this->expiredUserId = null;
     }
 
     public function userId(): int|string|null
@@ -49,11 +51,11 @@ final class NativeSessionStore implements AuthSessionStoreInterface
         $lastActivityAt = (int) ($_SESSION[$this->activityKey] ?? $startedAt);
 
         if ($this->absoluteTimeout !== null && ($now - $startedAt) >= $this->absoluteTimeout) {
-            $this->expire('absolute_timeout');
+            $this->expire($userId, 'absolute_timeout');
             return null;
         }
         if ($this->idleTimeout !== null && ($now - $lastActivityAt) >= $this->idleTimeout) {
-            $this->expire('idle_timeout');
+            $this->expire($userId, 'idle_timeout');
             return null;
         }
 
@@ -66,19 +68,24 @@ final class NativeSessionStore implements AuthSessionStoreInterface
     {
         unset($_SESSION[$this->scopedKey], $_SESSION[$this->startedKey], $_SESSION[$this->activityKey]);
         $this->expirationReason = null;
+        $this->expiredUserId = null;
     }
 
-    public function consumeExpirationReason(): ?string
+    /** @return array{reason:string,user_id:int|string}|null */
+    public function consumeExpiration(): ?array
     {
-        $reason = $this->expirationReason;
+        if ($this->expirationReason === null || $this->expiredUserId === null) { return null; }
+        $expiration = ['reason' => $this->expirationReason, 'user_id' => $this->expiredUserId];
         $this->expirationReason = null;
-        return $reason;
+        $this->expiredUserId = null;
+        return $expiration;
     }
 
-    private function expire(string $reason): void
+    private function expire(int|string $userId, string $reason): void
     {
         unset($_SESSION[$this->scopedKey], $_SESSION[$this->startedKey], $_SESSION[$this->activityKey]);
         $this->expirationReason = $reason;
+        $this->expiredUserId = $userId;
     }
 
     private function normalizeTimeout(?int $seconds): ?int
