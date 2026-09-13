@@ -20,6 +20,7 @@ final class AuthManager
     private ?object $context = null;
     private ?object $events = null;
     private ?object $autoLogger = null;
+    private bool $loggingEnabled = true;
 
     public function __construct(
         AuthUserProviderInterface|array|null $users = null,
@@ -42,6 +43,13 @@ final class AuthManager
 
     public function prefabConfigure(): void
     {
+        $logging = PrefabConfig::resolve('auth', 'logging', $this->config, ['enabled' => true]);
+        $loggingValue = $logging['value'];
+        $this->loggingEnabled = is_array($loggingValue)
+            ? (bool) ($loggingValue['enabled'] ?? true)
+            : (bool) $loggingValue;
+        PrefabRuntime::recordResolution('auth', 'logging', $logging['source'], ['enabled' => $this->loggingEnabled]);
+
         if (!$this->session) {
             $session = PrefabConfig::resolve('auth', 'session', $this->config);
             if ($session['value'] instanceof AuthSessionStoreInterface) {
@@ -78,7 +86,7 @@ final class AuthManager
             }
         }
 
-        if (!$this->autoLogger) {
+        if ($this->loggingEnabled && !$this->autoLogger) {
             $logger = PrefabRuntime::resolveEntry('logger');
             if ($logger) {
                 $this->autoLogger = $logger['value'];
@@ -181,7 +189,7 @@ final class AuthManager
 
     private function result(bool $success, ?AuthenticatableUserInterface $user, ?array $log, ?string $error = null): AuthResult
     {
-        if ($log) {
+        if ($log && $this->loggingEnabled) {
             if ($this->events && method_exists($this->events, 'dispatch')) {
                 $this->events->dispatch('prefab.log', $log);
             } elseif ($this->autoLogger && method_exists($this->autoLogger, 'record')) {
@@ -204,12 +212,22 @@ final class AuthManager
         $failed = $action === 'auth.login_failed';
         $actorId = $failed ? ($context['actor_id'] ?? null) : $userId;
         $meta = array_merge($metadata, $context['metadata'] ?? []);
+        $scopeType = strtoupper((string) ($context['scope_type'] ?? ($userId !== null ? 'USER' : 'APP')));
+        $scopePath = $context['scope_path'] ?? ($scopeType === 'USER' && $userId !== null ? (string) $userId : null);
+        $visibility = strtoupper((string) ($context['visibility'] ?? match ($scopeType) {
+            'USER' => 'USER',
+            'ORGANIZATION' => 'ORGANIZATION',
+            default => 'ADMIN',
+        }));
 
         return [
             'classification' => 'AUTH',
             'level' => $failed ? 'WARNING' : 'INFO',
             'module' => 'auth',
             'action' => $action,
+            'scope_type' => $scopeType,
+            'scope_path' => $scopePath,
+            'visibility' => $visibility,
             'subject_type' => 'user',
             'subject_id' => $userId,
             'actor_type' => $actorId !== null ? 'user' : null,
