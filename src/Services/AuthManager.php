@@ -12,14 +12,6 @@ use Tihloh\Prefab\Auth\Contracts\AuthenticatableUserInterface;
 use Tihloh\Prefab\Auth\DTOs\AuthResult;
 use Tihloh\Prefab\Auth\Session\NativeSessionStore;
 
-/**
- * Standalone authentication service with optional Prefab auto-integration.
- *
- * Auth can use an explicit provider/session, PrefabConfig values, or compatible
- * Prefab capabilities discovered at runtime. Missing configuration is resolved
- * lazily on first use so normal application code does not need to call
- * prefabConfigure() manually.
- */
 final class AuthManager
 {
     private ?AuthUserProviderInterface $users = null;
@@ -28,6 +20,7 @@ final class AuthManager
     private ?object $context = null;
     private ?object $events = null;
     private ?object $autoLogger = null;
+    private bool $loggingEnabled = true;
 
     public function __construct(
         AuthUserProviderInterface|array|null $users = null,
@@ -35,113 +28,87 @@ final class AuthManager
     ) {
         if ($users instanceof AuthUserProviderInterface) {
             $this->users = $users;
-            PrefabRuntime::recordResolution(
-                'auth',
-                'user_provider',
-                'module-local',
-                ['provider' => $users::class],
-            );
+            PrefabRuntime::recordResolution('auth', 'user_provider', 'module-local', ['provider' => $users::class]);
         } elseif (is_array($users)) {
             $this->config = $users;
         }
 
         if ($session) {
             $this->session = $session;
-            PrefabRuntime::recordResolution(
-                'auth',
-                'session',
-                'module-local',
-                ['provider' => $session::class],
-            );
+            PrefabRuntime::recordResolution('auth', 'session', 'module-local', ['provider' => $session::class]);
         }
 
         PrefabRuntime::register('auth', $this);
     }
 
-    /** Resolve missing session/provider/logger references during startup/use. */
     public function prefabConfigure(): void
     {
+        $logging = PrefabConfig::resolve('auth', 'logging', $this->config, ['enabled' => true]);
+        $loggingValue = $logging['value'];
+        $this->loggingEnabled = is_array($loggingValue)
+            ? (bool) ($loggingValue['enabled'] ?? true)
+            : (bool) $loggingValue;
+        PrefabRuntime::recordResolution('auth', 'logging', $logging['source'], ['enabled' => $this->loggingEnabled]);
+
+        $timeout = PrefabConfig::resolve('auth', 'timeout', $this->config, [
+            'idle' => 1800,
+            'absolute' => 28800,
+        ]);
+        $timeoutValue = is_array($timeout['value']) ? $timeout['value'] : [];
+        $idleTimeout = $this->timeoutValue($timeoutValue['idle'] ?? 1800);
+        $absoluteTimeout = $this->timeoutValue($timeoutValue['absolute'] ?? 28800);
+        PrefabRuntime::recordResolution('auth', 'timeout', $timeout['source'], [
+            'idle' => $idleTimeout,
+            'absolute' => $absoluteTimeout,
+        ]);
+
         if (!$this->session) {
             $session = PrefabConfig::resolve('auth', 'session', $this->config);
-
             if ($session['value'] instanceof AuthSessionStoreInterface) {
                 $this->session = $session['value'];
-                PrefabRuntime::recordResolution(
-                    'auth',
-                    'session',
-                    $session['source'],
-                    ['provider' => $this->session::class],
-                );
+                PrefabRuntime::recordResolution('auth', 'session', $session['source'], ['provider' => $this->session::class]);
             } else {
-                $sessionKey = PrefabConfig::resolve(
-                    'auth',
-                    'session_key',
-                    $this->config,
-                    'auth:user_id',
+                $sessionKey = PrefabConfig::resolve('auth', 'session_key', $this->config, 'auth:user_id');
+                $this->session = new NativeSessionStore(
+                    (string) $sessionKey['value'],
+                    $idleTimeout,
+                    $absoluteTimeout,
                 );
-
-                $this->session = new NativeSessionStore((string) $sessionKey['value']);
-                PrefabRuntime::recordResolution(
-                    'auth',
-                    'session',
-                    $sessionKey['source'],
-                    [
-                        'provider' => NativeSessionStore::class,
-                        'session_key' => (string) $sessionKey['value'],
-                    ],
-                );
+                PrefabRuntime::recordResolution('auth', 'session', $sessionKey['source'], [
+                    'provider' => NativeSessionStore::class,
+                    'session_key' => (string) $sessionKey['value'],
+                    'idle_timeout' => $idleTimeout,
+                    'absolute_timeout' => $absoluteTimeout,
+                ]);
             }
         }
 
         if (!$this->users) {
             $provider = PrefabConfig::resolve('auth', 'provider', $this->config);
-
             if ($provider['value'] instanceof AuthUserProviderInterface) {
                 $this->users = $provider['value'];
-                PrefabRuntime::recordResolution(
-                    'auth',
-                    'user_provider',
-                    $provider['source'],
-                    ['provider' => $this->users::class],
-                );
+                PrefabRuntime::recordResolution('auth', 'user_provider', $provider['source'], ['provider' => $this->users::class]);
             } else {
                 $entry = PrefabRuntime::resolveEntry('user_provider');
                 $prefabUsers = PrefabRuntime::get('users');
-
                 if ($entry && $prefabUsers && $entry['provider'] === 'prefab-users') {
                     $this->users = new PrefabUsersAuthProvider($prefabUsers);
-                    PrefabRuntime::recordResolution(
-                        'auth',
-                        'user_provider',
-                        'prefab-capability',
-                        [
-                            'provider' => $entry['provider'],
-                            'adapter' => PrefabUsersAuthProvider::class,
-                        ],
-                    );
+                    PrefabRuntime::recordResolution('auth', 'user_provider', 'prefab-capability', [
+                        'provider' => $entry['provider'],
+                        'adapter' => PrefabUsersAuthProvider::class,
+                    ]);
                 } elseif ($entry && $entry['value'] instanceof AuthUserProviderInterface) {
                     $this->users = $entry['value'];
-                    PrefabRuntime::recordResolution(
-                        'auth',
-                        'user_provider',
-                        'prefab-capability',
-                        ['provider' => $entry['provider']],
-                    );
+                    PrefabRuntime::recordResolution('auth', 'user_provider', 'prefab-capability', ['provider' => $entry['provider']]);
                 }
             }
         }
 
-        if (!$this->autoLogger) {
+        if ($this->loggingEnabled && !$this->autoLogger) {
             $logger = PrefabRuntime::resolveEntry('logger');
-
             if ($logger) {
                 $this->autoLogger = $logger['value'];
-                PrefabRuntime::recordResolution(
-                    'auth',
-                    'logger',
-                    'prefab-capability',
-                    ['provider' => $logger['provider']],
-                );
+                PrefabRuntime::recordResolution('auth', 'logger', 'prefab-capability', ['provider' => $logger['provider']]);
             }
         }
 
@@ -165,29 +132,20 @@ final class AuthManager
         return $this;
     }
 
-    public function attempt(
-        string $identifier,
-        string $password,
-        array $context = [],
-    ): AuthResult {
+    public function attempt(string $identifier, string $password, array $context = []): AuthResult
+    {
         $user = $this->provider()->findByIdentifier($identifier);
 
         if (!$user || !$user->authIsActive()) {
             return $this->result(
                 false,
                 null,
-                $this->log(
-                    'auth.login_failed',
-                    null,
-                    $context,
-                    ['identifier' => $identifier],
-                ),
+                $this->log('auth.login_failed', null, $context, ['identifier' => $identifier]),
                 'invalid_credentials',
             );
         }
 
         $hash = $user->authPasswordHash();
-
         if (!$hash || !password_verify($password, $hash)) {
             return $this->result(
                 false,
@@ -198,94 +156,87 @@ final class AuthManager
         }
 
         $this->session()->put($user->authId());
-
-        return $this->result(
-            true,
-            $user,
-            $this->log('auth.login', $user->authId(), $context),
-        );
+        return $this->result(true, $user, $this->log('auth.login', $user->authId(), $context));
     }
 
-    public function login(
-        AuthenticatableUserInterface $user,
-        array $context = [],
-    ): AuthResult {
+    public function login(AuthenticatableUserInterface $user, array $context = []): AuthResult
+    {
         if (!$user->authIsActive()) {
             return new AuthResult(false, null, null, 'inactive');
         }
 
         $this->session()->put($user->authId());
-
-        return $this->result(
-            true,
-            $user,
-            $this->log('auth.login', $user->authId(), $context),
-        );
+        return $this->result(true, $user, $this->log('auth.login', $user->authId(), $context));
     }
 
     public function logout(array $context = []): AuthResult
     {
-        $id = $this->session()->userId();
+        $id = $this->currentUserId();
         $log = $this->log('auth.logout', $id, $context);
         $this->session()->forget();
-
         return $this->result(true, null, $log);
     }
 
     public function check(): bool
     {
-        return $this->session()->userId() !== null;
+        return $this->currentUserId() !== null;
     }
 
     public function id(): int|string|null
     {
-        return $this->session()->userId();
+        return $this->currentUserId();
     }
 
     public function user(): ?AuthenticatableUserInterface
     {
-        $id = $this->session()->userId();
-
+        $id = $this->currentUserId();
         return $id === null ? null : $this->provider()->findById($id);
     }
 
     private function provider(): AuthUserProviderInterface
     {
-        if (!$this->users) {
-            $this->prefabConfigure();
-        }
-
-        return $this->users
-            ?? throw new RuntimeException(
-                'Prefab Auth needs an auth provider or compatible user_provider capability.',
-            );
+        if (!$this->users) { $this->prefabConfigure(); }
+        return $this->users ?? throw new RuntimeException('Prefab Auth needs an auth provider or compatible user_provider capability.');
     }
 
     private function session(): AuthSessionStoreInterface
     {
-        if (!$this->session) {
-            $this->prefabConfigure();
-        }
-
-        return $this->session
-            ?? throw new RuntimeException('Prefab Auth session is unavailable.');
+        if (!$this->session) { $this->prefabConfigure(); }
+        return $this->session ?? throw new RuntimeException('Prefab Auth session is unavailable.');
     }
 
-    private function result(
-        bool $success,
-        ?AuthenticatableUserInterface $user,
-        ?array $log,
-        ?string $error = null,
-    ): AuthResult {
-        if ($log) {
-            if ($this->events && method_exists($this->events, 'dispatch')) {
-                $this->events->dispatch('prefab.log', $log);
-            } elseif ($this->autoLogger && method_exists($this->autoLogger, 'record')) {
-                $this->autoLogger->record($log);
-            }
-        }
+    private function currentUserId(): int|string|null
+    {
+        $session = $this->session();
+        $id = $session->userId();
+        if ($id !== null || !method_exists($session, 'consumeExpiration')) { return $id; }
 
+        $expiration = $session->consumeExpiration();
+        if (is_array($expiration) && isset($expiration['reason'], $expiration['user_id'])) {
+            $this->emitLog($this->log(
+                'auth.session_expired',
+                $expiration['user_id'],
+                [],
+                ['reason' => (string) $expiration['reason']],
+            ));
+        }
+        return null;
+    }
+
+    private function result(bool $success, ?AuthenticatableUserInterface $user, ?array $log, ?string $error = null): AuthResult
+    {
+        if ($log) { $this->emitLog($log); }
         return new AuthResult($success, $user, $log, $error);
+    }
+
+    private function emitLog(array $log): void
+    {
+        if (!$this->loggingEnabled) { return; }
+        if ($this->events && method_exists($this->events, 'dispatch')) {
+            $this->events->dispatch('prefab.log', $log);
+        } elseif ($this->autoLogger && method_exists($this->autoLogger, 'record')) {
+            $this->autoLogger->record($log);
+        }
     }
 
     private function log(
@@ -297,26 +248,55 @@ final class AuthManager
         $base = ($this->context && method_exists($this->context, 'logContext'))
             ? $this->context->logContext()
             : [];
-
         $context = array_replace($base, $context);
-        $actorId = $action === 'auth.login_failed'
-            ? ($context['actor_id'] ?? null)
-            : $userId;
+        $failed = $action === 'auth.login_failed';
+        $expired = $action === 'auth.session_expired';
+        $actorId = $failed ? ($context['actor_id'] ?? null) : $userId;
+        $meta = array_merge($metadata, $context['metadata'] ?? []);
+        $scopeType = strtoupper((string) ($context['scope_type'] ?? ($userId !== null ? 'USER' : 'APP')));
+        $scopePath = $context['scope_path'] ?? ($scopeType === 'USER' && $userId !== null ? (string) $userId : null);
+        $visibility = strtoupper((string) ($context['visibility'] ?? match ($scopeType) {
+            'USER' => 'USER',
+            'ORGANIZATION' => 'ORGANIZATION',
+            default => 'ADMIN',
+        }));
 
         return [
+            'classification' => 'AUTH',
+            'level' => $failed ? 'WARNING' : ($expired ? 'NOTICE' : 'INFO'),
+            'module' => 'auth',
             'action' => $action,
+            'scope_type' => $scopeType,
+            'scope_path' => $scopePath,
+            'visibility' => $visibility,
             'subject_type' => 'user',
             'subject_id' => $userId,
             'actor_type' => $actorId !== null ? 'user' : null,
             'actor_id' => $actorId,
+            'status' => $failed ? 'FAILED' : ($expired ? null : 'SUCCESS'),
             'message' => match ($action) {
                 'auth.login' => 'User signed in.',
                 'auth.logout' => 'User signed out.',
+                'auth.session_expired' => 'User session expired.',
                 default => 'Sign-in attempt failed.',
             },
-            'metadata' => array_merge($metadata, $context['metadata'] ?? []),
+            'metadata' => $meta,
+            'details' => [
+                'context' => array_filter([
+                    'method' => $expired ? 'session' : 'password',
+                    'reason' => $failed ? 'invalid_credentials' : ($expired ? ($meta['reason'] ?? 'expired') : null),
+                ], static fn (mixed $value): bool => $value !== null),
+                'meta' => $meta,
+            ],
             'ip_address' => $context['ip_address'] ?? null,
             'user_agent' => $context['user_agent'] ?? null,
         ];
+    }
+
+    private function timeoutValue(mixed $value): ?int
+    {
+        if ($value === null || $value === false || $value === '') { return null; }
+        $seconds = (int) $value;
+        return $seconds > 0 ? $seconds : null;
     }
 }
