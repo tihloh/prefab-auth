@@ -207,9 +207,17 @@ final class AuthManager
     }
 
     public function login(
-        AuthenticatableUserInterface $user,
+        AuthenticatableUserInterface|int|string $user,
         array $context = [],
     ): AuthResult {
+        if (!$user instanceof AuthenticatableUserInterface) {
+            $user = $this->provider()->findById($user);
+
+            if (!$user) {
+                return new AuthResult(false, null, null, 'user_not_found');
+            }
+        }
+
         if (!$user->authIsActive()) {
             return new AuthResult(false, null, null, 'inactive');
         }
