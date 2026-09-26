@@ -278,10 +278,14 @@ final class AuthManager
         ?string $error = null,
     ): AuthResult {
         if ($log) {
-            if ($this->events && method_exists($this->events, 'dispatch')) {
-                $this->events->dispatch('prefab.log', $log);
-            } elseif ($this->autoLogger && method_exists($this->autoLogger, 'record')) {
-                $this->autoLogger->record($log);
+            try {
+                if ($this->events && method_exists($this->events, 'dispatch')) {
+                    $this->events->dispatch('prefab.log', $log);
+                } elseif ($this->autoLogger && method_exists($this->autoLogger, 'record')) {
+                    $this->autoLogger->record($log);
+                }
+            } catch (\Throwable $e) {
+                error_log('Prefab Auth logging failed: ' . $e->getMessage());
             }
         }
 
